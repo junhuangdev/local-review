@@ -1,0 +1,27 @@
+services:
+  gitea:
+    image: __LOCAL_REVIEW_IMAGE__
+    container_name: __LOCAL_REVIEW_CONTAINER__
+    restart: "no"
+    environment:
+      USER_UID: "__LOCAL_REVIEW_UID__"
+      USER_GID: "__LOCAL_REVIEW_GID__"
+      TZ: Asia/Shanghai
+      GITEA__actions__ENABLED: "false"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__repository__DEFAULT_PRIVATE: private
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__server__DOMAIN: 127.0.0.1
+      GITEA__server__HTTP_ADDR: 0.0.0.0
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__ROOT_URL: http://127.0.0.1:__LOCAL_REVIEW_HTTP_PORT__/
+      GITEA__server__SSH_DOMAIN: 127.0.0.1
+      GITEA__server__SSH_LISTEN_PORT: "22"
+      GITEA__server__SSH_PORT: "__LOCAL_REVIEW_SSH_PORT__"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__service__REQUIRE_SIGNIN_VIEW: "true"
+    ports:
+      - "127.0.0.1:__LOCAL_REVIEW_HTTP_PORT__:3000"
+      - "127.0.0.1:__LOCAL_REVIEW_SSH_PORT__:22"
+    volumes:
+      - __LOCAL_REVIEW_GITEA_DIR__:/data

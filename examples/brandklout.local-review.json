@@ -1,0 +1,25 @@
+{
+  "project": "brandklout",
+  "repos": [
+    {
+      "name": "good-review-api",
+      "path": "good-review-api",
+      "base": "development"
+    },
+    {
+      "name": "brandklout-frontend-next",
+      "path": "brandklout-frontend-next",
+      "base": "development"
+    },
+    {
+      "name": "brandklout-frontend",
+      "path": "brandklout-frontend",
+      "base": "development"
+    }
+  ],
+  "ignoreWorktrees": [
+    "scenario-*",
+    "runtime-smoke"
+  ],
+  "githubPrGate": "Only create a GitHub PR after the user explicitly says 正式提 PR, 推到 GitHub, or an equivalent external-publish instruction."
+}

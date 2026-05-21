@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+
+LOCAL_REVIEW_HOME="${LOCAL_REVIEW_HOME:-$HOME/.local/share/local-review}"
+LOCAL_REVIEW_HTTP_PORT="${LOCAL_REVIEW_HTTP_PORT:-3300}"
+LOCAL_REVIEW_SSH_PORT="${LOCAL_REVIEW_SSH_PORT:-3222}"
+LOCAL_REVIEW_IMAGE="${LOCAL_REVIEW_IMAGE:-gitea/gitea:1.26.1}"
+LOCAL_REVIEW_USER="${LOCAL_REVIEW_USER:-localreview}"
+LOCAL_REVIEW_EMAIL="${LOCAL_REVIEW_EMAIL:-localreview@example.invalid}"
+LOCAL_REVIEW_CONTAINER="${LOCAL_REVIEW_CONTAINER:-local-review-gitea}"
+LOCAL_REVIEW_COMPOSE_PROJECT="${LOCAL_REVIEW_COMPOSE_PROJECT:-local-review}"
+
+STATE_DIR="$LOCAL_REVIEW_HOME/state"
+GITEA_DIR="$LOCAL_REVIEW_HOME/gitea"
+LOG_DIR="$LOCAL_REVIEW_HOME/logs"
+GENERATED_DIR="$LOCAL_REVIEW_HOME/generated"
+PASSWORD_FILE="$STATE_DIR/admin-password.txt"
+COMPOSE_FILE="$GENERATED_DIR/docker-compose.yml"
+ENV_FILE="$GENERATED_DIR/.env"
+
+die() {
+  printf 'local-review: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf 'local-review: %s\n' "$*"
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  local-review up
+  local-review down
+  local-review status
+  local-review open
+  local-review password
+  local-review init-project --project <path>
+  local-review publish --project <path> --repo <name-or-path> [--base <branch>] [--head <branch>]
+  local-review list --project <path>
+  local-review rollback
+  local-review rollback-delete-data
+
+Environment:
+  LOCAL_REVIEW_HOME       default: ~/.local/share/local-review
+  LOCAL_REVIEW_HTTP_PORT  default: 3300
+  LOCAL_REVIEW_SSH_PORT   default: 3222
+  LOCAL_REVIEW_IMAGE      default: gitea/gitea:1.26.1
+EOF
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+require_common() {
+  require_cmd git
+  require_cmd curl
+  require_cmd jq
+  require_cmd openssl
+}
+
+require_docker() {
+  require_cmd docker
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+}
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR" "$GITEA_DIR" "$LOG_DIR" "$GENERATED_DIR"
+  chmod 700 "$STATE_DIR"
+}
+
+write_runtime_files() {
+  ensure_dirs
+  local uid gid
+  uid=$(id -u)
+  gid=$(id -g)
+  sed \
+    -e "s#__LOCAL_REVIEW_IMAGE__#$LOCAL_REVIEW_IMAGE#g" \
+    -e "s#__LOCAL_REVIEW_CONTAINER__#$LOCAL_REVIEW_CONTAINER#g" \
+    -e "s#__LOCAL_REVIEW_HTTP_PORT__#$LOCAL_REVIEW_HTTP_PORT#g" \
+    -e "s#__LOCAL_REVIEW_SSH_PORT__#$LOCAL_REVIEW_SSH_PORT#g" \
+    -e "s#__LOCAL_REVIEW_UID__#$uid#g" \
+    -e "s#__LOCAL_REVIEW_GID__#$gid#g" \
+    -e "s#__LOCAL_REVIEW_GITEA_DIR__#$GITEA_DIR#g" \
+    "$REPO_DIR/templates/docker-compose.gitea.yml" > "$COMPOSE_FILE"
+  cat > "$ENV_FILE" <<EOF
+COMPOSE_PROJECT_NAME=$LOCAL_REVIEW_COMPOSE_PROJECT
+EOF
+}
+
+compose() {
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" "$@"
+}
+
+backend_url() {
+  printf 'http://127.0.0.1:%s' "$LOCAL_REVIEW_HTTP_PORT"
+}
+
+ensure_password() {
+  ensure_dirs
+  if [ ! -s "$PASSWORD_FILE" ]; then
+    umask 077
+    openssl rand -hex 18 > "$PASSWORD_FILE"
+    chmod 600 "$PASSWORD_FILE"
+  fi
+}
+
+password() {
+  [ -s "$PASSWORD_FILE" ] || die "Password file does not exist. Run: local-review up"
+  cat "$PASSWORD_FILE"
+}
+
+api() {
+  local method="$1"
+  local path="$2"
+  local data="${3:-}"
+  local pw
+  pw=$(password)
+  if [ -n "$data" ]; then
+    curl -fsS -u "$LOCAL_REVIEW_USER:$pw" -H 'Content-Type: application/json' -X "$method" "$(backend_url)$path" -d "$data"
+  else
+    curl -fsS -u "$LOCAL_REVIEW_USER:$pw" -X "$method" "$(backend_url)$path"
+  fi
+}
+
+wait_for_backend() {
+  local attempt
+  for attempt in $(seq 1 60); do
+    if curl -fsS -o /dev/null "$(backend_url)/" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "Gitea did not become ready at $(backend_url)"
+}
+
+ensure_admin_user() {
+  ensure_password
+  local pw
+  pw=$(password)
+  if compose exec -T --user git gitea gitea admin user list --config /data/gitea/conf/app.ini | awk 'NR > 1 {print $2}' | grep -qx "$LOCAL_REVIEW_USER"; then
+    return 0
+  fi
+  compose exec -T --user git gitea gitea admin user create \
+    --config /data/gitea/conf/app.ini \
+    --username "$LOCAL_REVIEW_USER" \
+    --password "$pw" \
+    --email "$LOCAL_REVIEW_EMAIL" \
+    --admin \
+    --must-change-password=false >/dev/null
+}
+
+cmd_up() {
+  require_docker
+  write_runtime_files
+  ensure_password
+  compose up -d
+  wait_for_backend
+  ensure_admin_user
+  info "ready: $(backend_url)"
+}
+
+cmd_down() {
+  require_docker
+  write_runtime_files
+  compose down
+}
+
+cmd_status() {
+  require_docker
+  write_runtime_files
+  compose ps
+  printf '\nWeb: %s\n' "$(backend_url)"
+  printf 'User: %s\n' "$LOCAL_REVIEW_USER"
+  printf 'Password file: %s\n' "$PASSWORD_FILE"
+  printf 'Runtime home: %s\n' "$LOCAL_REVIEW_HOME"
+}
+
+cmd_open() {
+  if command -v open >/dev/null 2>&1; then
+    open "$(backend_url)"
+  else
+    printf '%s\n' "$(backend_url)"
+  fi
+}
+
+parse_project_arg() {
+  local project=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --project)
+        [ "$#" -ge 2 ] || die "Missing value for --project"
+        project="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+  [ -n "$project" ] || die "Missing --project <path>"
+  cd "$project" >/dev/null 2>&1 || die "Project path not found: $project"
+  pwd
+}
+
+config_path() {
+  local project="$1"
+  printf '%s/.local-review.json' "$project"
+}
+
+cmd_init_project() {
+  local project
+  project=$(parse_project_arg "$@")
+  local cfg
+  cfg=$(config_path "$project")
+  [ ! -e "$cfg" ] || die "Project config already exists: $cfg"
+  cat > "$cfg" <<'EOF'
+{
+  "project": "example",
+  "repos": [
+    {
+      "name": "example-repo",
+      "path": "example-repo",
+      "base": "main"
+    }
+  ],
+  "ignoreWorktrees": [
+    "scenario-*",
+    "runtime-smoke"
+  ],
+  "githubPrGate": "Only create a GitHub PR after the user explicitly asks for it."
+}
+EOF
+  info "created $cfg"
+}
+
+repo_field() {
+  local cfg="$1"
+  local repo="$2"
+  local field="$3"
+  jq -r --arg repo "$repo" --arg field "$field" '
+    .repos[]
+    | select(.name == $repo or .path == $repo)
+    | .[$field] // empty
+  ' "$cfg" | head -n 1
+}
+
+parse_publish_args() {
+  PUBLISH_PROJECT=""
+  PUBLISH_REPO=""
+  PUBLISH_BASE=""
+  PUBLISH_HEAD=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --project)
+        [ "$#" -ge 2 ] || die "Missing value for --project"
+        PUBLISH_PROJECT="$2"
+        shift 2
+        ;;
+      --repo)
+        [ "$#" -ge 2 ] || die "Missing value for --repo"
+        PUBLISH_REPO="$2"
+        shift 2
+        ;;
+      --base)
+        [ "$#" -ge 2 ] || die "Missing value for --base"
+        PUBLISH_BASE="$2"
+        shift 2
+        ;;
+      --head)
+        [ "$#" -ge 2 ] || die "Missing value for --head"
+        PUBLISH_HEAD="$2"
+        shift 2
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+  [ -n "$PUBLISH_PROJECT" ] || die "Missing --project <path>"
+  [ -n "$PUBLISH_REPO" ] || die "Missing --repo <name-or-path>"
+}
+
+ensure_repo_exists() {
+  local name="$1"
+  local description="$2"
+  if api GET "/api/v1/repos/$LOCAL_REVIEW_USER/$name" >/dev/null 2>&1; then
+    return 0
+  fi
+  local payload
+  payload=$(jq -n --arg name "$name" --arg description "$description" \
+    '{name:$name, private:true, auto_init:false, description:$description, has_pull_requests:true}')
+  api POST "/api/v1/user/repos" "$payload" >/dev/null
+}
+
+set_default_branch() {
+  local name="$1"
+  local base="$2"
+  local payload
+  payload=$(jq -n --arg base "$base" '{default_branch:$base}')
+  api PATCH "/api/v1/repos/$LOCAL_REVIEW_USER/$name" "$payload" >/dev/null
+}
+
+wait_for_pull_requests() {
+  local name="$1"
+  local attempt
+  for attempt in $(seq 1 30); do
+    if api GET "/api/v1/repos/$LOCAL_REVIEW_USER/$name/pulls?state=open" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "Pull request API did not become ready for $LOCAL_REVIEW_USER/$name"
+}
+
+find_pull_number() {
+  local name="$1"
+  local base="$2"
+  local head="$3"
+  api GET "/api/v1/repos/$LOCAL_REVIEW_USER/$name/pulls?state=open" |
+    jq -r --arg base "$base" --arg head "$head" '
+      .[]
+      | select(.base.ref == $base and .head.ref == $head)
+      | .number
+    ' | head -n 1
+}
+
+create_pull() {
+  local name="$1"
+  local base="$2"
+  local head="$3"
+  local title="$4"
+  local body="$5"
+  local payload
+  payload=$(jq -n \
+    --arg title "$title" \
+    --arg body "$body" \
+    --arg base "$base" \
+    --arg head "$head" \
+    '{title:$title, body:$body, base:$base, head:$head}')
+  api POST "/api/v1/repos/$LOCAL_REVIEW_USER/$name/pulls" "$payload"
+}
+
+cmd_publish() {
+  require_common
+  cmd_up >/dev/null
+  parse_publish_args "$@"
+  local project cfg repo_name repo_path base head repo_abs remote_url auth description
+  project=$(cd "$PUBLISH_PROJECT" && pwd)
+  cfg=$(config_path "$project")
+  [ -f "$cfg" ] || die "Missing project config: $cfg"
+  repo_name=$(repo_field "$cfg" "$PUBLISH_REPO" name)
+  repo_path=$(repo_field "$cfg" "$PUBLISH_REPO" path)
+  base="${PUBLISH_BASE:-$(repo_field "$cfg" "$PUBLISH_REPO" base)}"
+  [ -n "$repo_name" ] || die "Repo not found in project config: $PUBLISH_REPO"
+  [ -n "$repo_path" ] || die "Repo path missing for: $repo_name"
+  [ -n "$base" ] || die "Base branch missing for: $repo_name"
+  repo_abs="$project/$repo_path"
+  git -C "$repo_abs" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not a git repo: $repo_abs"
+  head="${PUBLISH_HEAD:-$(git -C "$repo_abs" branch --show-current)}"
+  [ -n "$head" ] || die "Detached HEAD requires --head <branch>"
+  git -C "$repo_abs" rev-parse --verify "$base" >/dev/null 2>&1 || die "Base branch not found locally: $base"
+  git -C "$repo_abs" rev-parse --verify "$head" >/dev/null 2>&1 || die "Head branch not found locally: $head"
+
+  description="Local-only review mirror for $repo_name"
+  ensure_repo_exists "$repo_name" "$description"
+  remote_url="$(backend_url)/$LOCAL_REVIEW_USER/$repo_name.git"
+  if git -C "$repo_abs" remote get-url local-review >/dev/null 2>&1; then
+    git -C "$repo_abs" remote set-url local-review "$remote_url"
+  else
+    git -C "$repo_abs" remote add local-review "$remote_url"
+  fi
+
+  auth=$(printf '%s:%s' "$LOCAL_REVIEW_USER" "$(password)" | base64 | tr -d '\n')
+  git -C "$repo_abs" -c credential.helper= -c http.extraHeader="Authorization: Basic $auth" \
+    push local-review "$base:refs/heads/$base" "$head:refs/heads/$head"
+
+  set_default_branch "$repo_name" "$base"
+  wait_for_pull_requests "$repo_name"
+
+  local number title body result
+  number=$(find_pull_number "$repo_name" "$base" "$head")
+  if [ -z "$number" ]; then
+    title="Local review: $head"
+    body="Local-only review request generated by local-review. This is not a GitHub pull request."
+    result=$(create_pull "$repo_name" "$base" "$head" "$title" "$body")
+    number=$(printf '%s' "$result" | jq -r '.number')
+  fi
+  api GET "/api/v1/repos/$LOCAL_REVIEW_USER/$repo_name/pulls/$number" |
+    jq '{number, state, title, base: .base.ref, head: .head.ref, html_url, mergeable}'
+}
+
+cmd_list() {
+  require_common
+  local project cfg repo_name
+  project=$(parse_project_arg "$@")
+  cfg=$(config_path "$project")
+  [ -f "$cfg" ] || die "Missing project config: $cfg"
+  jq -r '.repos[].name' "$cfg" | while IFS= read -r repo_name; do
+    api GET "/api/v1/repos/$LOCAL_REVIEW_USER/$repo_name/pulls?state=open" 2>/dev/null |
+      jq -r --arg repo "$repo_name" '.[] | "\($repo)\t#\(.number)\t\(.base.ref)<-\(.head.ref)\t\(.html_url)"' || true
+  done
+}
+
+cmd_password() {
+  [ -s "$PASSWORD_FILE" ] || die "Password file does not exist. Run: local-review up"
+  printf 'User: %s\n' "$LOCAL_REVIEW_USER"
+  printf 'Password file: %s\n' "$PASSWORD_FILE"
+}
+
+cmd_rollback() {
+  cmd_down
+  info "stopped local review; data remains at $LOCAL_REVIEW_HOME"
+}
+
+cmd_rollback_delete_data() {
+  require_docker
+  write_runtime_files
+  compose down -v
+  rm -rf "$LOCAL_REVIEW_HOME"
+  info "deleted $LOCAL_REVIEW_HOME"
+}
+
+case "${1:-help}" in
+  up)
+    shift
+    cmd_up "$@"
+    ;;
+  down)
+    shift
+    cmd_down "$@"
+    ;;
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  open)
+    shift
+    cmd_open "$@"
+    ;;
+  password)
+    shift
+    cmd_password "$@"
+    ;;
+  init-project)
+    shift
+    cmd_init_project "$@"
+    ;;
+  publish)
+    shift
+    cmd_publish "$@"
+    ;;
+  list)
+    shift
+    cmd_list "$@"
+    ;;
+  rollback)
+    shift
+    cmd_rollback "$@"
+    ;;
+  rollback-delete-data)
+    shift
+    cmd_rollback_delete_data "$@"
+    ;;
+  version|--version|-v)
+    printf '%s\n' "$VERSION"
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
