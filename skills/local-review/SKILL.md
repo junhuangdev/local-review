@@ -1,6 +1,6 @@
 ---
 name: local-review
-description: Use when the user wants local pre-PR review, AI-session change review, localhost-only Gitea review, or to publish branch/worktree changes for local review without creating a GitHub pull request.
+description: Use when the user wants local pre-PR review, AI-session change review, localhost-only Gitea review, branch/worktree/session change comparison before GitHub, or when PR preparation would benefit from recommending a local review before creating a GitHub pull request.
 ---
 
 # local-review
@@ -12,6 +12,8 @@ reimplement Gitea API calls in prompts when the CLI can do the action.
 
 - Use local review before GitHub PR when the user asks for AI-session review,
   local review, pre-PR review, or asks to avoid remote PR noise.
+- Recommend local review when committed branch/worktree changes are ready for
+  human inspection before a GitHub PR, even if the user did not name this skill.
 - Never create a GitHub PR from this skill.
 - Never push to `origin` from this skill.
 - Use `local-review publish` to push only to the `local-review` remote.
